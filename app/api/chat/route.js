@@ -41,35 +41,66 @@ export async function POST(request) {
       parts: [{ text: message.content }],
     }));
 
-    let response;
+    let response = null;
+    let lastError = null;
 
-    // Try twice because Gemini can temporarily return 503
-    // when the model is experiencing high demand.
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // Retry temporary Gemini availability/rate-limit errors.
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         response = await ai.models.generateContent({
           model: "gemini-3.8-flash",
           contents,
           config: {
             systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.7,
             maxOutputTokens: 1024,
           },
         });
 
         break;
       } catch (error) {
-        if (error?.status === 503 && attempt === 1) {
-          console.log("Gemini is busy. Retrying...");
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-          continue;
+        lastError = error;
+
+        const status = error?.status;
+
+        if (status !== 429 && status !== 503) {
+          throw error;
         }
 
-        throw error;
+        if (attempt < 2) {
+          const delay = 2000 * 2 ** attempt;
+          console.log(
+            `Gemini returned ${status}. Retrying in ${delay}ms...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
       }
     }
 
-    const reply = response?.text;
+    if (!response) {
+      if (lastError?.status === 429) {
+        return Response.json(
+          {
+            error:
+              "NovaChat is temporarily rate-limited. Please try again in a moment.",
+          },
+          { status: 429 }
+        );
+      }
+
+      if (lastError?.status === 503) {
+        return Response.json(
+          {
+            error:
+              "NovaChat is temporarily busy. Please try again in a moment.",
+          },
+          { status: 503 }
+        );
+      }
+
+      throw lastError;
+    }
+
+    const reply = response.text;
 
     if (!reply) {
       return Response.json(
@@ -81,16 +112,6 @@ export async function POST(request) {
     return Response.json({ reply });
   } catch (error) {
     console.error("Gemini API error:", error);
-
-    if (error?.status === 503) {
-      return Response.json(
-        {
-          error:
-            "NovaChat is temporarily busy. Please try sending your message again in a moment.",
-        },
-        { status: 503 }
-      );
-    }
 
     return Response.json(
       {
